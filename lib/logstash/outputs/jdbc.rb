@@ -204,34 +204,70 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
     connection = nil
     statement = nil
     events_to_retry = []
-
+    
     begin
       connection = @pool.getConnection
+      connection.setAutoCommit(false) unless @driver_auto_commit
     rescue => e
       log_jdbc_exception(e, true, nil)
-      # If a connection is not available, then the server has gone away
-      # We're not counting that towards our retry count.
       return events, false
     end
-
-    events.each do |event|
-      begin
-        statement = connection.prepareStatement(
-          (@unsafe_statement == true) ? event.sprintf(@statement[0]) : @statement[0]
-        )
-        statement = add_statement_event_params(statement, event) if @statement.length > 1
-        statement.execute
-      rescue => e
-        if retry_exception?(e, event.to_json())
-          events_to_retry.push(event)
+  
+    begin
+      if @driver_auto_commit
+        events.each do |event|
+          begin
+            statement = connection.prepareStatement(
+              (@unsafe_statement == true) ? event.sprintf(@statement[0]) : @statement[0]
+            )
+            statement = add_statement_event_params(statement, event) if @statement.length > 1
+            statement.execute()
+          rescue => e
+            if retry_exception?(e, event.to_json())
+              events_to_retry.push(event)
+            end
+          ensure
+            statement.close unless statement.nil?
+          end
         end
-      ensure
-        statement.close unless statement.nil?
+      else
+        statement = connection.prepareStatement(@statement[0])
+        
+        events.each do |event|
+          begin
+            if @statement.length > 1
+              statement = add_statement_event_params(statement, event)
+            end
+            statement.addBatch()
+          rescue => e
+            if retry_exception?(e, event.to_json())
+              events_to_retry.push(event)
+            end
+          end
+        end
+        
+        statement.executeBatch()
+        
+        connection.commit()
       end
+      
+    rescue => e
+      unless @driver_auto_commit
+        begin
+          connection.rollback() unless connection.nil?
+        rescue => rollback_error
+          @logger.error('JDBC - Rollback failed', :error => rollback_error)
+        end
+      end
+      
+      events_to_retry = events
+      log_jdbc_exception(e, true, events.length.to_s + ' events')
+      
+    ensure
+      statement.close unless statement.nil?
+      connection.close unless connection.nil?
     end
-
-    connection.close unless connection.nil?
-
+    
     return events_to_retry, true
   end
 
